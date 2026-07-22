@@ -1,0 +1,406 @@
+================================================================================
+PANDUAN LENGKAP ENGINE v1.0.1‑beta
+Dokumentasi Resmi Engine Ride‑Hailing
+================================================================================
+
+Versi dokumen: 2.0.0
+Tanggal: 16 Juli 2026
+
+================================================================================
+DAFTAR ISI
+  1. Pendahuluan
+  2. Perubahan dari v1.0.0‑beta ke v1.0.1‑beta
+  3. Arsitektur Engine
+  4. Memulai Engine
+  5. Alur Data
+  6. Cara Penggunaan API
+  7. Referensi API Lengkap
+     7.1 Engine – Fungsi Orkestrasi
+     7.2 Engine.Valid – Validasi & Utility
+     7.3 Engine.Fare – Kalkulasi Tarif
+     7.4 Engine.Cost – Kalkulasi Biaya
+     7.5 Engine.Extra – Ringkasan, Proyeksi, Badge
+     7.6 Cache – Wrapper Performa Tinggi
+     7.7 Fungsi Bantuan
+  8. Daftar Sel (Input & Output)
+  9. Mode Operasional
+ 10. Prinsip Desain & Komunikasi UI‑Engine
+ 11. Contoh Penggunaan
+ 12. Troubleshooting
+ 13. Catatan Penting
+ 14. Panduan Migrasi dari v1.0.0‑beta
+
+================================================================================
+1. PENDAHULUAN
+================================================================================
+Engine v1.0.1‑beta adalah mesin kalkulasi ride‑hailing yang disempurnakan dari
+v1.0.0‑beta. Seluruh rumus diambil dari Excel "v9.7k masterapp.xlsx" (Sheet
+"v9.7k-All").
+
+Perubahan utama:
+- Arsitektur berbasis objek kalkulasi sementara (temp) dan deklarasi dependensi
+  (deps) pada setiap fungsi sel.
+- Evaluasi demand‑driven: hanya sel yang diperlukan yang dihitung.
+- Tidak ada lagi parameter buatan – setiap fungsi sel hanya membaca dari temp
+  seperti spreadsheet membaca sel lain.
+- Wrapper internal (getFareParams, calcOnlineFare, dll.) dihapus; orkestrasi
+  dilakukan oleh fungsi compute di 06api.js dengan topological sort.
+- Default UI untuk input numerik sekarang null (placeholder kosong); fallback
+  validasi tetap sesuai Excel.
+
+Cache (07cache.js) tetap sebagai wrapper opsional dengan 3 mode: off, minimal,
+maksimal. Mode maksimal kini menggunakan injeksi tabel prekomputasi ke
+Engine.Cost (tanpa monkey‑patching).
+
+================================================================================
+2. PERUBAHAN DARI v1.0.0‑beta KE v1.0.1‑beta
+================================================================================
++-----------------------------------------------+------------------------------------------+
+| v1.0.0‑beta                                   | v1.0.1‑beta                              |
++-----------------------------------------------+------------------------------------------+
+| Fungsi sel dengan parameter buatan             | Fungsi sel (temp) => value + deps       |
+| Wrapper internal di Fare/Cost/Extra            | Dihapus, orkestrasi via compute          |
+| Objek hasil gabungan fp, cp, pickupCost        | Hanya sel target yang diminta            |
+| default value input numerik = fallback         | default UI = null, fallback validasi     |
+|                                              | terpisah                                 |
+| getMaxPickupDistance = E260 (2.5 km)          | = E266 (2 km)                            |
+| Cache mode maksimal: monkey‑patching AFC       | Injeksi setLookupCache ke Engine.Cost    |
++-----------------------------------------------+------------------------------------------+
+
+Dampak bagi aplikasi:
+- Hapus pemanggilan: Engine.Fare.getFareParams, Engine.Cost.getCostParams,
+  Engine.Extra.getExtraBase, dll. Gunakan fungsi orkestrasi (estimatePickup,
+  estimateDropoff) atau panggil sel satuan dengan objek temp buatan.
+- Gunakan getDefaultValues() untuk placeholder UI (numerik = null).
+- getMaxPickupDistance() sekarang mengembalikan 2 km, sesuaikan UI jika perlu.
+
+================================================================================
+3. ARSITEKTUR ENGINE
+================================================================================
+ 01data.js       Konstanta & tabel lookup (pajak, perawatan, AFC, dll.)
+ 02valid.js      Validasi input & default value UI
+ 03fare.js       Fungsi sel tarif (E655‑E755) + properti deps
+ 04cost.js       Fungsi sel biaya (E787‑E987) + properti deps
+ 05extra.js      Fungsi sel extra (E998‑E1113) + properti deps
+ 06api.js        Orkestrasi: compute, topological sort, namespace
+ 07cache.js      Wrapper cache eksternal (opsional)
+
+Setiap fungsi sel di Fare/Cost/Extra menerima satu parameter: temp – objek
+kalkulasi sementara yang berisi nilai sel-sel yang sudah dihitung. Properti
+deps pada setiap fungsi mendeklarasikan sel apa saja yang diperlukan.
+06api.js menggabungkan semua fungsi sel ke dalam objek CELLS, lalu fungsi
+compute akan:
+  1. Mengumpulkan target + seluruh dependensinya.
+  2. Mengurutkan dengan topological sort.
+  3. Mengeksekusi setiap sel, menyimpan hasil di temp.
+Dengan demikian, jika rumus Excel berubah, cukup ubah fungsi sel dan deps-nya;
+tidak perlu menyentuh wrapper atau API.
+
+================================================================================
+4. MEMULAI ENGINE
+================================================================================
+File dimuat berurutan:
+  01data.js → 02valid.js → 03fare.js → 04cost.js → 05extra.js → 06api.js
+Global Engine siap digunakan.
+
+Untuk caching, muat 07cache.js setelah 06api.js. Aplikasi dapat memanggil Cache
+sebagai pengganti Engine. Cache memiliki API yang identik untuk semua fungsi
+orkestrasi. Untuk fungsi non-orkestrasi (mis. validasi dropdown), akses
+Cache.Engine.
+
+================================================================================
+5. ALUR DATA
+================================================================================
+  UI -> validasi (Engine.Valid) -> objek valid
+     -> estimatePickup(valid, uiStateE71?)   -> pickupEst
+     -> estimateDropoff(valid, pickupEst)    -> fullEst
+     -> realityPickup(valid, fullEst)        -> pickupReal
+     -> realityDropoff(valid, fullEst, pickupReal) -> realLengkap
+
+  Objek temp hanya hidup selama satu panggilan orkestrasi, lalu dibuang.
+  Engine tetap stateless.
+
+================================================================================
+6. CARA PENGGUNAAN API
+================================================================================
+  1. Validasi Home:
+     const home = Engine.Valid.validateHome({
+         E10: 'Mobil', E20: 'Jabodetabek', E22: '1000cc',
+         E24: 'Pertalite', E26: 'manual', E28: 'individu'
+     });
+
+  2. Validasi Order (membutuhkan home):
+     const order = Engine.Valid.validateOrder({
+         E36: 'online', E46: 'Standar', E56: 30000
+     }, home);
+     const valid = Object.assign({}, home, order);
+
+  3. Estimate Pickup:
+     const pickup = Cache.estimatePickup(valid);    // online
+     // mode offline "app":
+     const pickupApp = Cache.estimatePickup(validOff, 4500);
+
+  4. Estimate Dropoff:
+     const est = Cache.estimateDropoff(valid, pickup);
+
+  5. Reality:
+     const realPickup = Cache.realityPickup(realInput, est);
+     const real = Cache.realityDropoff(realInput, est, realPickup);
+
+  6. Shortcut (tidak di-cache):
+     const semua = Cache.complete(validLengkap);
+
+  7. Biaya Operasional:
+     const op = Cache.getOperationalCost(home, 15, 45);
+
+================================================================================
+7. REFERENSI API LENGKAP
+================================================================================
+
+7.1 Engine – Fungsi Orkestrasi
+  estimatePickup(valid, uiStateE71?)
+    Mengembalikan objek berisi sel target pickup (E655..E679, E787..E809,
+    E815..E947). Parameter uiStateE71 (number) digunakan untuk mode offline
+    "app", sama seperti di v1.0.0‑beta.
+
+  estimateDropoff(valid, pickupEst)
+    Mengembalikan objek berisi sel dinamis, cost dropoff, dan extra (E692..E718,
+    E864..E975, E998..E1107). valid harus mengandung data order (E36, E46, dsb).
+
+  realityPickup(valid, est)
+    Menghitung realitas pickup + tagihan selisih. valid minimal: E78, E80.
+    Mengembalikan E871..E961 dan E725..E742.
+
+  realityDropoff(valid, est, pickupReal)
+    Menghitung realitas dropoff + extra. valid: E82, E84, opsional E92,
+    E100, E102, E104. Mengembalikan E872..E987, E727..E755, E998..E1113.
+
+  reality(valid, est?, uiStateE71?)
+    Shortcut pickup + dropoff. Jika est tidak diberikan, dihitung dari awal.
+
+  complete(valid, uiStateE71?)
+    Sama dengan reality(valid, null, uiStateE71).
+
+  Catatan: Objek yang dikembalikan hanya berisi sel target, tidak termasuk
+  properti input atau sel antara yang tidak diminta. Semua properti merujuk
+  ke kunci sel Excel (mis. est.E969, real.E981).
+
+7.2 Engine.Valid – Validasi & Utility
+  validateHome(input)          -> objek home
+  validateOrder(input, home)   -> objek order
+  validateEstimate(input, home?) -> gabungan home+order
+  validateReality(input)       -> objek reality
+  validate(input)              -> semua
+  validateCell(cell, value, context?) -> nilai tunggal
+  getDropdownOptions(cell, context?)  -> string[]
+  getServiceOptions(mode, cc)         -> string[]
+  getValidationRange(cell, context?)  -> {min, max, fallback}
+  getDefaultValues()                  -> objek default untuk UI
+
+  Perubahan dari v1.0.0‑beta:
+  - getValidationRange mengembalikan properti fallback, bukan default.
+  - getDefaultValues sekarang memberikan:
+    * null untuk semua input numerik independen.
+    * Nilai terhitung untuk input dependen (E40), berdasarkan default E10.
+      Jika dependensi tidak tersedia, null.
+    * Nilai string sesuai hasil validasi kosong untuk input non-numerik.
+
+7.3 Engine.Fare – Kalkulasi Tarif
+  Hanya berisi fungsi sel satuan. Contoh pemanggilan manual:
+    const temp = { E10: 'Mobil', E46: 'Standar', ... };
+    const komisi = Engine.Fare.E655(temp);
+
+  Daftar fungsi sel: E655, E656, E657, E658, E659, E660, E661, E662, E663,
+  E668, E669, E670, E671, E677, E678, E679, E680, E682, E683, E684, E686,
+  E687, E692, E693, E694, E695, E696, E697, E698, E699, E700, E701, E706,
+  E707, E708, E709, E713, E714, E715, E716, E717, E718, E719, E725..E755.
+
+7.4 Engine.Cost – Kalkulasi Biaya
+  Fungsi sel satuan: E787..E809, E815..E949, E969..E975, E871..E963,
+  E981..E987.
+  Helper: getAFC, getPerawatanSpeedFactor, setLookupCache (untuk cache).
+  calcOperationalCost tetap sebagai fungsi convenience (tidak melalui temp).
+
+7.5 Engine.Extra – Ringkasan, Proyeksi, Badge
+  Fungsi sel satuan: E998..E1113. Tidak ada lagi pembungkus getExtraBase, dll.
+
+7.6 Cache – Wrapper Performa Tinggi
+  API identik dengan Engine, dengan tambahan manajemen mode:
+    setMode('off' | 'minimal' | 'maksimal')
+    getMode()
+    invalidate('home' | 'order' | 'order-dynamic' | 'tracking' | 'all')
+    clear()
+    getStats()
+  Mode maksimal: melakukan prekomputasi tabel AFC & faktor kecepatan, lalu
+  menginjeksi ke Engine.Cost via setLookupCache. Tidak ada monkey‑patching.
+  Cache opsional; jika 07cache.js tidak dimuat, aplikasi tetap berjalan
+  dengan Engine langsung.
+
+7.7 Fungsi Bantuan
+  getMaxPickupDistance() -> 2 km (DATA.E266)
+  getMaxPickupTime()     -> 15 menit (DATA.E267)
+  getOperationalCost(valid, distance, time) -> {bbm, maintenance, depreciation,
+                                                tax, attribute, total}
+
+================================================================================
+8. DAFTAR SEL (INPUT & OUTPUT)
+================================================================================
+Sama seperti v1.0.0‑beta, mengacu ke Excel v9.7k. Lihat dokumentasi sebelumnya.
+Perubahan kecil: E266 (2 km) digunakan oleh getMaxPickupDistance.
+
+================================================================================
+9. MODE OPERASIONAL
+================================================================================
+Engine.getOperationalCost(valid, distance, time) dapat digunakan untuk
+menghitung biaya operasional murni tanpa order. Contoh:
+  const home = Engine.Valid.validateHome({E10:'Mobil', E22:'1000cc', ...});
+  const cost = Cache.getOperationalCost(home, 15, 45);
+  console.log(cost.total); // total biaya
+
+================================================================================
+10. PRINSIP DESAIN & KOMUNIKASI UI‑ENGINE
+================================================================================
+- Engine murni, tidak menyimpan state.
+- Input HARUS divalidasi (Engine.Valid).
+- Semua fungsi publik mengembalikan objek baru.
+- UI bertanggung jawab menyimpan uiStateE71 untuk mode offline "app".
+- Objek temp tidak perlu diketahui oleh UI.
+- Cache adalah wrapper opsional; Engine tetap berfungsi tanpa cache.
+
+================================================================================
+11. CONTOH PENGGUNAAN
+================================================================================
+
+Contoh 1: Estimasi Online Lengkap
+
+  // 1. Home
+  const home = Engine.Valid.validateHome({
+      E10: 'Mobil', E12: 'Driver', E20: 'Jabodetabek',
+      E22: '1000cc', E24: 'Pertalite', E26: 'manual', E28: 'individu'
+  });
+  // 2. Order
+  const order = Engine.Valid.validateOrder({
+      E36: 'online', E46: 'Standar', E56: 30000, E58: 0, E60: 0
+  }, home);
+  const valid = Object.assign({}, home, order);
+  // 3. Pickup
+  const pickup = Cache.estimatePickup(valid);
+  console.log(pickup.E660); // tarif minimum zona
+  // 4. Dropoff
+  const est = Cache.estimateDropoff(valid, pickup);
+  console.log(est.E969); // pendapatan driver est
+  console.log(est.E1102); // badge estimasi
+
+
+Contoh 2: Offline "app" dengan uiStateE71
+
+  // Setelah estimasi online, simpan nilai E713 dari est
+  const savedE713 = est.E713;
+  // User pindah ke offline "app"
+  const offlineOrder = Engine.Valid.validateOrder({
+      E36: 'offline', E38: 'app', E46: 'Standar', E68: 8.2, E70: 25
+  }, home);
+  const validOff = Object.assign({}, home, offlineOrder);
+  const pickupApp = Cache.estimatePickup(validOff, savedE713);
+  const estApp = Cache.estimateDropoff(validOff, pickupApp);
+
+
+Contoh 3: Tracking Reality
+
+  const realInput = Engine.Valid.validateReality({
+      E78: 2.5, E80: 12, E82: 10, E84: 25, E92: 5000
+  });
+  const realPickup = Cache.realityPickup(realInput, est);
+  const real = Cache.realityDropoff(realInput, est, realPickup);
+  console.log(real.E981); // pendapatan driver real
+  console.log(real.E1112); // badge tracking
+
+
+Contoh 4: Akses Sel Satuan Manual
+
+  // Membutuhkan objek temp yang berisi semua dependensi
+  const temp = {
+      E10: 'Mobil', E46: 'Standar', E36: 'online', E20: 'Jabodetabek',
+      E24: 'Pertalite', E26: 'manual', E28: 'individu',
+      E56: 30000, E58: 0, E60: 0, E12: 'Driver', E54: 50000,
+      E92: 0, E68: 5, E70: 30, E100: 0, E102: 0, E104: 0,
+      E78: 2, E80: 10, E82: 8, E84: 20,
+      // isi dependensi lain jika diperlukan, atau panggil melalui orkestrasi
+  };
+  // Panggil satu sel
+  const pendapatanDriver = Engine.Cost.E969(temp);
+  // Cara lebih mudah: gunakan estimateDropoff yang otomatis menghitung semua.
+
+
+Contoh 5: Biaya Operasional
+
+  const home = Engine.Valid.validateHome({
+      E10: 'Motor', E22: '125cc', E24: 'Pertalite', E26: 'manual'
+  });
+  const op = Cache.getOperationalCost(home, 10, 20);
+  console.log(op);
+  // { bbm: ..., maintenance: ..., depreciation: ..., tax: ..., attribute: ..., total: ... }
+
+
+Contoh 6: Default UI & Validasi
+
+  const defaultValues = Engine.Valid.getDefaultValues();
+  // defaultValues.E40 = 0.4 (Mobil), E54 = null, E56 = null, ...
+  // UI menggunakan ini sebagai nilai awal.
+  // Setelah user mengisi, kirim ke validasi.
+  const home = Engine.Valid.validateHome({
+      E10: 'Mobil', E20: 'Jabodetabek', E22: null, // akan di-fallback
+  });
+  console.log(home.E22); // '1000cc' (fallback)
+
+
+================================================================================
+12. TROUBLESHOOTING
+================================================================================
+- "Engine.Fare.getFareParams is not a function"
+  -> Fungsi wrapper telah dihapus. Gunakan estimatePickup atau panggil sel satuan.
+- "Cannot read property 'E655' of undefined"
+  -> Saat memanggil sel satuan, pastikan objek temp berisi semua sel yang
+     diperlukan (cek deps). Lebih mudah gunakan fungsi orkestrasi.
+- Hasil NaN atau tidak wajar:
+  -> Periksa apakah input numerik masih null. Lakukan validasi terlebih dahulu.
+- Cache tidak berfungsi:
+  -> Periksa console: Engine harus versi 1.0.1‑beta. Mode mungkin 'off' jika
+     versi tidak cocok.
+- getMaxPickupDistance mengembalikan 2 km:
+  -> Ini adalah perubahan yang disengaja. Jika UI menampilkan 2.5 km, perbarui.
+
+================================================================================
+13. CATATAN PENTING
+================================================================================
+- Seluruh kalkulasi mengacu ke Excel "v9.7k masterapp.xlsx", sheet "v9.7k-All".
+- Jika 07cache.js tidak dimuat, aplikasi tetap berjalan normal tanpa cache.
+- Pada mode offline "app", jika uiStateE71 bukan number, akan fallback ke E677.
+- Objek hasil orkestrasi tidak lagi mengandung properti fp atau cp.
+
+================================================================================
+14. PANDUAN MIGRASI DARI v1.0.0‑beta
+================================================================================
+1. Ganti semua file engine dengan versi baru (01data.js s/d 07cache.js).
+2. Hapus pemanggilan wrapper internal:
+   - Engine.Fare.getFareParams -> ganti dengan Engine.estimatePickup atau
+     panggil sel satuan dengan temp buatan.
+   - Engine.Cost.getCostParams, calcPickupEstimate, dll. -> hapus.
+   - Engine.Extra.getExtraBase, getComparison, dll. -> hapus, gunakan hasil
+     dari estimateDropoff/realityDropoff yang sudah mencakup semua.
+3. Jika aplikasi menampilkan placeholder input numerik, gunakan
+   getDefaultValues() baru yang mengembalikan null. Saat validasi, null akan
+   otomatis diubah ke fallback. Pastikan UI mengirimkan nilai numerik valid.
+4. Perbarui penggunaan getMaxPickupDistance() menjadi 2 km jika perlu.
+5. Fungsi reality dan complete sekarang menerima parameter ketiga uiStateE71
+   (opsional). Periksa pemanggilan yang ada.
+6. Jika menggunakan mode maksimal cache, tidak ada perubahan API.
+7. Pastikan urutan pemuatan file: 01data.js, 02valid.js, 03fare.js, 04cost.js,
+   05extra.js, 06api.js, (opsional 07cache.js).
+
+Setelah migrasi, jalankan pengujian dengan data dari Excel untuk memastikan
+hasil tetap konsisten.
+
+================================================================================
+AKHIR DOKUMENTASI
+================================================================================
